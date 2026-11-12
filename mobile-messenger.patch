@@ -1,0 +1,543 @@
+diff --git a/app/lib/inbox_poller.dart b/app/lib/inbox_poller.dart
+new file mode 100644
+index 0000000..4b6e684
+--- /dev/null
++++ b/app/lib/inbox_poller.dart
+@@ -0,0 +1,101 @@
++import 'dart:async';
++
++import 'package:flutter/foundation.dart';
++
++import 'messaging.dart';
++
++class InboxPoller {
++  InboxPoller({
++    required this.fetch,
++    required this.onPage,
++    required this.isChatOpen,
++  });
++
++  final Future<InboxPage> Function(String viewer, {String? after}) fetch;
++  final void Function(InboxPage page, String? after, bool refresh) onPage;
++  final bool Function() isChatOpen;
++
++  String? _viewer;
++  String? _cursor;
++  Timer? _timer;
++  int _generation = 0;
++  int _idlePolls = 0;
++  int _failures = 0;
++  bool _running = false;
++  bool _refreshPending = false;
++
++  void start(String viewer) {
++    _viewer = viewer;
++    unawaited(poll(refresh: true));
++  }
++
++  void pause() {
++    _viewer = null;
++    _generation++;
++    _refreshPending = false;
++    _timer?.cancel();
++    _timer = null;
++  }
++
++  void reset() {
++    pause();
++    _cursor = null;
++    _idlePolls = 0;
++    _failures = 0;
++  }
++
++  Future<void> poll({bool refresh = false}) async {
++    final viewer = _viewer;
++    if (viewer == null) return;
++    if (_running) {
++      if (refresh) _refreshPending = true;
++      return;
++    }
++
++    _timer?.cancel();
++    _running = true;
++    final generation = _generation;
++    var hasMore = false;
++    try {
++      final after = _cursor;
++      final page = await fetch(viewer, after: after);
++      if (generation != _generation) return;
++      if (page.hasMore &&
++          after != null &&
++          BigInt.parse(page.cursor) <= BigInt.parse(after)) {
++        throw const FormatException('Inbox cursor did not advance');
++      }
++      _cursor = page.cursor;
++      _failures = 0;
++      _idlePolls = refresh || page.events.isNotEmpty ? 0 : _idlePolls + 1;
++      hasMore = page.hasMore;
++      onPage(page, after, refresh);
++    } on Exception catch (error) {
++      if (generation == _generation) {
++        if (_failures == 0) {
++          debugPrint('Inbox refresh failed: ${error.runtimeType}');
++        }
++        _failures++;
++      }
++    } finally {
++      _running = false;
++      if (_viewer != null) {
++        if (_refreshPending || (hasMore && generation == _generation)) {
++          final pending = _refreshPending;
++          _refreshPending = false;
++          unawaited(poll(refresh: pending));
++        } else {
++          final seconds = switch ((_failures, _idlePolls)) {
++            (>= 3, _) => 30,
++            (2, _) => 15,
++            (1, _) => 6,
++            (_, >= 6) when !isChatOpen() => 15,
++            (_, >= 3) when !isChatOpen() => 6,
++            _ => 3,
++          };
++          _timer = Timer(Duration(seconds: seconds), () => unawaited(poll()));
++        }
++      }
++    }
++  }
++}
+diff --git a/app/lib/main.dart b/app/lib/main.dart
+index 8c1de0d..b5737e4 100644
+--- a/app/lib/main.dart
++++ b/app/lib/main.dart
+@@ -10,6 +10,7 @@ import 'package:image_picker/image_picker.dart';
+ 
+ import 'haptics.dart';
+ import 'brand.dart';
++import 'inbox_poller.dart';
+ import 'invitation.dart';
+ import 'invitation_scanner.dart';
+ import 'messaging.dart';
+@@ -200,13 +201,14 @@ class _HomeState extends State<_Home> with WidgetsBindingObserver {
+   final _chatChanges = ValueNotifier(0);
+   final _hiringChanges = ValueNotifier(0);
+   String? _activeChat;
+-  String? _inboxCursor;
+-  Timer? _inboxTimer;
++  late final _inbox = InboxPoller(
++    fetch: (viewer, {after}) => widget.messaging.inbox(viewer, after: after),
++    onPage: _receiveInbox,
++    isChatOpen: () => _activeChat != null || _tab == _Tab.chat,
++  );
+   int _inboxGeneration = 0;
+   int _unreadChat = 0;
+   int _unreadHiring = 0;
+-  bool _checkingInbox = false;
+-  bool _inboxPending = false;
+   bool _notificationPollingConfigured = false;
+   String? _registeredPushToken;
+ 
+@@ -244,7 +246,7 @@ class _HomeState extends State<_Home> with WidgetsBindingObserver {
+       _pushChannel.setMethodCallHandler(null);
+     }
+     _invitationCode.dispose();
+-    _inboxTimer?.cancel();
++    _inbox.pause();
+     _chatChanges.dispose();
+     _hiringChanges.dispose();
+     _name.dispose();
+@@ -352,8 +354,7 @@ class _HomeState extends State<_Home> with WidgetsBindingObserver {
+       _startInbox();
+       return;
+     }
+-    _inboxTimer?.cancel();
+-    _inboxTimer = null;
++    _inbox.pause();
+   }
+ 
+   Future<void> _load() async {
+@@ -430,6 +431,7 @@ class _HomeState extends State<_Home> with WidgetsBindingObserver {
+       _message = null;
+     });
+     if (tab == _Tab.hiring) unawaited(_readHiring());
++    if (tab == _Tab.chat) unawaited(_inbox.poll(refresh: true));
+   }
+ 
+   Future<void> _save() async {
+@@ -565,17 +567,12 @@ class _HomeState extends State<_Home> with WidgetsBindingObserver {
+     final state = WidgetsBinding.instance.lifecycleState;
+     if (state != null && state != AppLifecycleState.resumed) return;
+     unawaited(_registerPush());
+-    _inboxTimer ??= Timer.periodic(const Duration(seconds: 3), (_) {
+-      unawaited(_pollInbox());
+-    });
+-    unawaited(_pollInbox(refresh: true));
++    _inbox.start(_id!);
+   }
+ 
+   void _clearInbox() {
+-    _inboxTimer?.cancel();
+-    _inboxTimer = null;
++    _inbox.reset();
+     _inboxGeneration++;
+-    _inboxCursor = null;
+     _notificationPollingConfigured = false;
+     if (_hasInvitationLinks) {
+       unawaited(_clearNotificationPolling());
+@@ -653,48 +650,25 @@ class _HomeState extends State<_Home> with WidgetsBindingObserver {
+     }
+   }
+ 
+-  Future<void> _pollInbox({bool refresh = false}) async {
+-    if (!mounted || _profile == null || _inboxTimer == null) return;
+-    if (_checkingInbox) {
+-      if (refresh) _inboxPending = true;
+-      return;
++  void _receiveInbox(InboxPage inbox, String? after, bool refresh) {
++    unawaited(_configureNotificationPolling(after ?? inbox.cursor));
++    unawaited(_showPollingEvents(inbox, after));
++    final chatCountChanged = _unreadChat != inbox.unreadChat;
++    if (chatCountChanged || _unreadHiring != inbox.unreadHiring) {
++      setState(() {
++        _unreadChat = inbox.unreadChat;
++        _unreadHiring = inbox.unreadHiring;
++      });
+     }
+-    _checkingInbox = true;
+-    final generation = _inboxGeneration;
+-    try {
+-      final after = _inboxCursor;
+-      final inbox = await widget.messaging.inbox(_id!, after: after);
+-      if (!mounted || generation != _inboxGeneration || _inboxTimer == null) {
+-        return;
+-      }
+-      _inboxCursor = inbox.cursor;
+-      unawaited(_configureNotificationPolling(after ?? inbox.cursor));
+-      unawaited(_showPollingEvents(inbox, after));
+-      final chatCountChanged = _unreadChat != inbox.unreadChat;
+-      if (chatCountChanged || _unreadHiring != inbox.unreadHiring) {
+-        setState(() {
+-          _unreadChat = inbox.unreadChat;
+-          _unreadHiring = inbox.unreadHiring;
+-        });
+-      }
+-      if (refresh ||
+-          chatCountChanged ||
+-          inbox.events.any((event) => event.kind == 'message')) {
+-        _chatChanges.value++;
+-      }
+-      if (inbox.events.any((event) => event.kind == 'hiring')) {
+-        _hiringChanges.value++;
+-        if (_tab == _Tab.hiring && inbox.unreadHiring > 0) {
+-          unawaited(_readHiring());
+-        }
+-      }
+-    } on Exception {
+-      // The next foreground refresh retries without discarding the last counts.
+-    } finally {
+-      _checkingInbox = false;
+-      if (_inboxPending && mounted) {
+-        _inboxPending = false;
+-        unawaited(_pollInbox(refresh: true));
++    if (refresh ||
++        chatCountChanged ||
++        inbox.events.any((event) => event.kind == 'message')) {
++      _chatChanges.value++;
++    }
++    if (inbox.events.any((event) => event.kind == 'hiring')) {
++      _hiringChanges.value++;
++      if (_tab == _Tab.hiring && inbox.unreadHiring > 0) {
++        unawaited(_readHiring());
+       }
+     }
+   }
+@@ -703,7 +677,7 @@ class _HomeState extends State<_Home> with WidgetsBindingObserver {
+     if (_profile == null) return;
+     try {
+       await widget.messaging.readHiring(_id!);
+-      if (mounted) await _pollInbox(refresh: true);
++      if (mounted) await _inbox.poll(refresh: true);
+     } on Exception {
+       // An unread badge stays visible until the API confirms the change.
+     }
+@@ -730,6 +704,7 @@ class _HomeState extends State<_Home> with WidgetsBindingObserver {
+     if (id == null || _profile == null || _activeChat == peer.contactId) return;
+     final previous = _activeChat;
+     _activeChat = peer.contactId;
++    unawaited(_inbox.poll(refresh: true));
+     await Navigator.of(context).push<void>(
+       MaterialPageRoute(
+         builder: (_) => ConversationPage(
+@@ -739,7 +714,7 @@ class _HomeState extends State<_Home> with WidgetsBindingObserver {
+           changes: _chatChanges,
+           onRead: () {
+             _chatChanges.value++;
+-            unawaited(_pollInbox());
++            unawaited(_inbox.poll());
+           },
+           onSent: () => _chatChanges.value++,
+         ),
+@@ -748,7 +723,7 @@ class _HomeState extends State<_Home> with WidgetsBindingObserver {
+     if (!mounted) return;
+     _activeChat = previous;
+     _chatChanges.value++;
+-    await _pollInbox(refresh: true);
++    await _inbox.poll(refresh: true);
+   }
+ 
+   Future<void> _openInvitation() async {
+diff --git a/app/lib/messaging.dart b/app/lib/messaging.dart
+index 16c707a..c607d0b 100644
+--- a/app/lib/messaging.dart
++++ b/app/lib/messaging.dart
+@@ -26,14 +26,14 @@ class ChatSummary {
+ 
+   factory ChatSummary.fromJson(Map<String, dynamic> data) => ChatSummary(
+     ChatPeer(
+-      data['contactId'] as String,
+-      data['displayName'] as String,
+-      occupation: data['occupation'] as String,
+-      photoVersion: data['photoVersion'] as String?,
++      _field<String>(data, 'contactId'),
++      _field<String>(data, 'displayName'),
++      occupation: _field<String>(data, 'occupation'),
++      photoVersion: _field<String?>(data, 'photoVersion'),
+     ),
+-    data['lastMessage'] as String,
+-    DateTime.parse(data['lastAt'] as String),
+-    data['unread'] as int,
++    _field<String>(data, 'lastMessage'),
++    DateTime.parse(_field<String>(data, 'lastAt')),
++    _field<int>(data, 'unread'),
+   );
+ 
+   final ChatPeer peer;
+@@ -46,10 +46,10 @@ class ChatMessage {
+   const ChatMessage(this.id, this.body, this.sentAt, this.isMine);
+ 
+   factory ChatMessage.fromJson(Map<String, dynamic> data) => ChatMessage(
+-    data['id'] as String,
+-    data['body'] as String,
+-    DateTime.parse(data['sentAt'] as String),
+-    data['isMine'] == true,
++    _cursor(data, 'id'),
++    _field<String>(data, 'body'),
++    DateTime.parse(_field<String>(data, 'sentAt')),
++    _field<bool>(data, 'isMine'),
+   );
+ 
+   final String id;
+@@ -71,12 +71,12 @@ class InboxEvent {
+   });
+ 
+   factory InboxEvent.fromJson(Map<String, dynamic> data) => InboxEvent(
+-    data['kind'] as String,
+-    data['subjectId'] as String,
+-    data['title'] as String,
+-    data['body'] as String,
++    _field<String>(data, 'kind'),
++    _field<String>(data, 'subjectId'),
++    _field<String>(data, 'title'),
++    _field<String>(data, 'body'),
+     data['read'] == true,
+-    id: data['id'] as String?,
++    id: data['id'] == null ? null : _cursor(data, 'id'),
+   );
+ 
+   final String kind;
+@@ -92,8 +92,23 @@ typedef InboxPage = ({
+   String cursor,
+   int unreadChat,
+   int unreadHiring,
++  bool hasMore,
+ });
+ 
++T _field<T>(Map<String, dynamic> data, String key) {
++  final value = data[key];
++  if (value is T) return value;
++  throw FormatException('Invalid messaging field: $key');
++}
++
++final _decimalId = RegExp(r'^(0|[1-9][0-9]{0,18})$');
++
++String _cursor(Map<String, dynamic> data, String key) {
++  final value = _field<String>(data, key);
++  if (_decimalId.hasMatch(value)) return value;
++  throw FormatException('Invalid messaging cursor: $key');
++}
++
+ class MessagingRepository {
+   MessagingRepository(this._client, this._baseUrl);
+ 
+@@ -172,9 +187,10 @@ class MessagingRepository {
+     );
+     return (
+       events: _items(data, 'events').map(InboxEvent.fromJson).toList(),
+-      cursor: data['cursor'] as String,
+-      unreadChat: data['unreadChat'] as int,
+-      unreadHiring: data['unreadHiring'] as int,
++      cursor: _cursor(data, 'cursor'),
++      unreadChat: _field<int>(data, 'unreadChat'),
++      unreadHiring: _field<int>(data, 'unreadHiring'),
++      hasMore: _field<bool?>(data, 'hasMore') ?? false,
+     );
+   }
+ 
+diff --git a/app/test/inbox_poller_test.dart b/app/test/inbox_poller_test.dart
+new file mode 100644
+index 0000000..bde3f28
+--- /dev/null
++++ b/app/test/inbox_poller_test.dart
+@@ -0,0 +1,55 @@
++import 'dart:async';
++
++import 'package:flutter_test/flutter_test.dart';
++import 'package:link_and_bring/inbox_poller.dart';
++import 'package:link_and_bring/messaging.dart';
++
++InboxPage _page(String cursor, {bool hasMore = false}) => (
++  cursor: cursor,
++  hasMore: hasMore,
++  events: [],
++  unreadChat: 0,
++  unreadHiring: 0,
++);
++
++void main() {
++  testWidgets('drains consecutive pages and ignores paused requests', (
++    tester,
++  ) async {
++    final requests = <({String? after, Completer<InboxPage> response})>[];
++    final received = <String>[];
++    final poller = InboxPoller(
++      fetch: (_, {after}) {
++        final response = Completer<InboxPage>();
++        requests.add((after: after, response: response));
++        return response.future;
++      },
++      onPage: (page, _, _) => received.add(page.cursor),
++      isChatOpen: () => true,
++    );
++    addTearDown(poller.pause);
++
++    poller.start('viewer');
++    requests[0].response.complete(_page('0'));
++    await tester.pump();
++    unawaited(poller.poll());
++    requests[1].response.complete(_page('50', hasMore: true));
++    await tester.pump();
++    expect(requests[2].after, '50');
++    requests[2].response.complete(_page('51'));
++    await tester.pump();
++    expect(received, ['0', '50', '51']);
++
++    unawaited(poller.poll());
++    poller.pause();
++    poller.start('viewer');
++    requests[3].response.complete(_page('52'));
++    await tester.pump();
++    expect(received, ['0', '50', '51']);
++    expect(requests[4].after, '51');
++    requests[4].response.complete(_page('52'));
++    await tester.pump();
++    expect(received.last, '52');
++    poller.pause();
++  });
++}
+diff --git a/app/test/messaging_test.dart b/app/test/messaging_test.dart
+index 59b0610..4480ce2 100644
+--- a/app/test/messaging_test.dart
++++ b/app/test/messaging_test.dart
+@@ -7,6 +7,25 @@ import 'package:http/testing.dart';
+ import 'package:link_and_bring/messaging.dart';
+ 
+ void main() {
++  test(
++    'rejects an invalid inbox response as a recoverable format error',
++    () async {
++      final repository = MessagingRepository(
++        MockClient(
++          (_) async => http.Response(
++            '{"events":[],"cursor":7,"unreadChat":0,"unreadHiring":0}',
++            200,
++          ),
++        ),
++        Uri.http('localhost'),
++      );
++      await expectLater(
++        repository.inbox('viewer'),
++        throwsA(isA<FormatException>()),
++      );
++    },
++  );
++
+   testWidgets(
+     'retry preserves message ID and received messages are marked read',
+     (tester) async {
+diff --git a/app/test/profile_test.dart b/app/test/profile_test.dart
+index d555f88..6c71bf7 100644
+--- a/app/test/profile_test.dart
++++ b/app/test/profile_test.dart
+@@ -363,7 +363,7 @@ class _ProfileApi {
+ 
+   Future<http.Response> handle(http.Request request) async {
+     requestCount++;
+-    expect(
++    expectSync(
+       request.headers['x-profile-id'],
+       '00000000-0000-4000-8000-000000000001',
+     );
+diff --git a/server/lib/messaging_api.dart b/server/lib/messaging_api.dart
+index b326e9a..37a11bd 100644
+--- a/server/lib/messaging_api.dart
++++ b/server/lib/messaging_api.dart
+@@ -123,8 +123,10 @@ class _MessagingStore {
+       );
+       await tx.execute(
+         Sql.named('''
+-          INSERT INTO push_devices (profile_id, token) VALUES (@viewer, @token)
+-          ON CONFLICT (profile_id) DO UPDATE SET token = EXCLUDED.token
++          INSERT INTO push_devices (profile_id, token, registered_at)
++          VALUES (@viewer, @token, clock_timestamp())
++          ON CONFLICT (profile_id) DO UPDATE
++          SET token = EXCLUDED.token, registered_at = EXCLUDED.registered_at
+           WHERE push_devices.token <> EXCLUDED.token
+         '''),
+         parameters: {'viewer': viewer, 'token': token},
+@@ -317,16 +319,20 @@ class _MessagingStore {
+     final rows = await _pool.execute(
+       Sql.named('''
+         WITH stats AS (
+-          SELECT coalesce(max(id), 0) AS latest,
+-                 count(*) FILTER (WHERE kind = 'message' AND read_at IS NULL) AS unread_chat,
+-                 count(*) FILTER (WHERE kind = 'hiring' AND read_at IS NULL) AS unread_hiring
+-          FROM inbox_events WHERE recipient_id = @viewer
++          SELECT count(*) FILTER (WHERE kind = 'message') AS unread_chat,
++                 count(*) FILTER (WHERE kind = 'hiring') AS unread_hiring
++          FROM inbox_events WHERE recipient_id = @viewer AND read_at IS NULL
+         ), page AS (
+           SELECT id, kind, subject_id, title, body, created_at, read_at IS NOT NULL AS is_read
+           FROM inbox_events WHERE recipient_id = @viewer AND id > @after
+           ORDER BY id LIMIT ${_pageSize + 1}
+         )
+-        SELECT page.*, stats.latest, stats.unread_chat, stats.unread_hiring
++        SELECT page.*,
++               coalesce(@after::bigint, (
++                 SELECT id FROM inbox_events
++                 WHERE recipient_id = @viewer ORDER BY id DESC LIMIT 1
++               ), 0) AS latest,
++               stats.unread_chat, stats.unread_hiring
+         FROM stats LEFT JOIN page ON true ORDER BY page.id
+       '''),
+       parameters: {'viewer': viewer, 'after': after},
+diff --git a/server/sql/008_inbox_unread_index.sql b/server/sql/008_inbox_unread_index.sql
+new file mode 100644
+index 0000000..3e58349
+--- /dev/null
++++ b/server/sql/008_inbox_unread_index.sql
+@@ -0,0 +1,6 @@
++BEGIN;
++
++CREATE INDEX IF NOT EXISTS inbox_events_unread_recipient_idx
++  ON inbox_events (recipient_id, kind) WHERE read_at IS NULL;
++
++COMMIT;
