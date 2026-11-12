@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 
 import 'package:flutter/material.dart';
@@ -27,7 +28,7 @@ void main() {
   );
 
   testWidgets(
-    'retry preserves message ID and received messages are marked read',
+    'retry after reopening preserves message ID and received messages are marked read',
     (tester) async {
       final changes = ValueNotifier(0);
       final attempts = <String>[];
@@ -71,7 +72,7 @@ void main() {
         Uri.http('localhost'),
       );
 
-      await tester.pumpWidget(
+      Future<void> openChat() => tester.pumpWidget(
         MaterialApp(
           home: ConversationPage(
             repository: repository,
@@ -82,12 +83,18 @@ void main() {
           ),
         ),
       );
+      await openChat();
       await tester.pumpAndSettle();
       await tester.enterText(find.byType(TextField), 'Hello');
       await tester.pump();
       await tester.tap(find.byTooltip('Send'));
       await tester.pumpAndSettle();
       expect(find.text('Couldn’t send. Tap Send to retry.'), findsOneWidget);
+      await tester.pumpWidget(const SizedBox());
+      await openChat();
+      await tester.pumpAndSettle();
+      await tester.enterText(find.byType(TextField), 'Hello');
+      await tester.pump();
       await tester.tap(find.byTooltip('Send'));
       await tester.pumpAndSettle();
       expect(attempts, hasLength(2));
@@ -103,4 +110,65 @@ void main() {
       changes.dispose();
     },
   );
+
+  testWidgets('queues an earlier page during a foreground refresh', (
+    tester,
+  ) async {
+    final changes = ValueNotifier(0);
+    final refresh = Completer<http.Response>();
+    final history = <String?>[];
+    var latestRequests = 0;
+
+    http.Response page(String id, String body, {required bool hasMore}) =>
+        http.Response(
+          jsonEncode({
+            'messages': [
+              {
+                'id': id,
+                'body': body,
+                'sentAt': '2026-11-11T10:00:00Z',
+                'isMine': true,
+              },
+            ],
+            'hasMore': hasMore,
+          }),
+          200,
+        );
+
+    final repository = MessagingRepository(
+      MockClient((request) async {
+        if (request.method == 'POST') return http.Response('', 204);
+        final before = request.url.queryParameters['before'];
+        history.add(before);
+        if (before != null) return page('1', 'Earlier', hasMore: false);
+        if (++latestRequests == 2) return refresh.future;
+        return page('2', 'Latest', hasMore: true);
+      }),
+      Uri.http('localhost'),
+    );
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: ConversationPage(
+          repository: repository,
+          viewer: 'viewer',
+          peer: const ChatPeer('peer', 'Jamie'),
+          changes: changes,
+          onRead: () {},
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+    changes.value++;
+    await tester.pump();
+    await tester.tap(find.text('Load earlier messages'));
+    await tester.pump();
+    expect(history, [null, null]);
+    refresh.complete(page('2', 'Latest', hasMore: true));
+    await tester.pumpAndSettle();
+    expect(history, [null, null, '2']);
+    expect(find.text('Earlier'), findsOneWidget);
+    await tester.pumpWidget(const SizedBox());
+    changes.dispose();
+  });
 }

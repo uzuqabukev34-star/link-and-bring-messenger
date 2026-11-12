@@ -106,7 +106,7 @@ index 0000000..4b6e684
 +  }
 +}
 diff --git a/app/lib/main.dart b/app/lib/main.dart
-index 8c1de0d..b5737e4 100644
+index 8c1de0d..dc3876c 100644
 --- a/app/lib/main.dart
 +++ b/app/lib/main.dart
 @@ -10,6 +10,7 @@ import 'package:image_picker/image_picker.dart';
@@ -163,7 +163,15 @@ index 8c1de0d..b5737e4 100644
    }
  
    Future<void> _save() async {
-@@ -565,17 +567,12 @@ class _HomeState extends State<_Home> with WidgetsBindingObserver {
+@@ -503,6 +505,7 @@ class _HomeState extends State<_Home> with WidgetsBindingObserver {
+     });
+     try {
+       await widget.repository.delete(_id!);
++      widget.messaging.clearPendingSends(_id!);
+       await widget.localStore.clearLegacyPhoto();
+       if (!mounted) return;
+       _invitationCode.value = null;
+@@ -565,17 +568,12 @@ class _HomeState extends State<_Home> with WidgetsBindingObserver {
      final state = WidgetsBinding.instance.lifecycleState;
      if (state != null && state != AppLifecycleState.resumed) return;
      unawaited(_registerPush());
@@ -183,7 +191,7 @@ index 8c1de0d..b5737e4 100644
      _notificationPollingConfigured = false;
      if (_hasInvitationLinks) {
        unawaited(_clearNotificationPolling());
-@@ -653,48 +650,25 @@ class _HomeState extends State<_Home> with WidgetsBindingObserver {
+@@ -653,48 +651,25 @@ class _HomeState extends State<_Home> with WidgetsBindingObserver {
      }
    }
  
@@ -250,7 +258,7 @@ index 8c1de0d..b5737e4 100644
        }
      }
    }
-@@ -703,7 +677,7 @@ class _HomeState extends State<_Home> with WidgetsBindingObserver {
+@@ -703,7 +678,7 @@ class _HomeState extends State<_Home> with WidgetsBindingObserver {
      if (_profile == null) return;
      try {
        await widget.messaging.readHiring(_id!);
@@ -259,7 +267,7 @@ index 8c1de0d..b5737e4 100644
      } on Exception {
        // An unread badge stays visible until the API confirms the change.
      }
-@@ -730,6 +704,7 @@ class _HomeState extends State<_Home> with WidgetsBindingObserver {
+@@ -730,6 +705,7 @@ class _HomeState extends State<_Home> with WidgetsBindingObserver {
      if (id == null || _profile == null || _activeChat == peer.contactId) return;
      final previous = _activeChat;
      _activeChat = peer.contactId;
@@ -267,7 +275,7 @@ index 8c1de0d..b5737e4 100644
      await Navigator.of(context).push<void>(
        MaterialPageRoute(
          builder: (_) => ConversationPage(
-@@ -739,7 +714,7 @@ class _HomeState extends State<_Home> with WidgetsBindingObserver {
+@@ -739,7 +715,7 @@ class _HomeState extends State<_Home> with WidgetsBindingObserver {
            changes: _chatChanges,
            onRead: () {
              _chatChanges.value++;
@@ -276,7 +284,7 @@ index 8c1de0d..b5737e4 100644
            },
            onSent: () => _chatChanges.value++,
          ),
-@@ -748,7 +723,7 @@ class _HomeState extends State<_Home> with WidgetsBindingObserver {
+@@ -748,7 +724,7 @@ class _HomeState extends State<_Home> with WidgetsBindingObserver {
      if (!mounted) return;
      _activeChat = previous;
      _chatChanges.value++;
@@ -286,7 +294,7 @@ index 8c1de0d..b5737e4 100644
  
    Future<void> _openInvitation() async {
 diff --git a/app/lib/messaging.dart b/app/lib/messaging.dart
-index 16c707a..c607d0b 100644
+index 16c707a..a0e6e69 100644
 --- a/app/lib/messaging.dart
 +++ b/app/lib/messaging.dart
 @@ -26,14 +26,14 @@ class ChatSummary {
@@ -344,7 +352,7 @@ index 16c707a..c607d0b 100644
    );
  
    final String kind;
-@@ -92,8 +92,23 @@ typedef InboxPage = ({
+@@ -92,13 +92,34 @@ typedef InboxPage = ({
    String cursor,
    int unreadChat,
    int unreadHiring,
@@ -365,10 +373,67 @@ index 16c707a..c607d0b 100644
 +  throw FormatException('Invalid messaging cursor: $key');
 +}
 +
++class _PendingSend {
++  final id = createUuidV4();
++  Future<ChatMessage>? request;
++}
++
  class MessagingRepository {
    MessagingRepository(this._client, this._baseUrl);
  
-@@ -172,9 +187,10 @@ class MessagingRepository {
+   final http.Client _client;
+   final Uri _baseUrl;
++  final _pendingSends = <(String, String, String), _PendingSend>{};
+   Uri get baseUrl => _baseUrl;
+ 
+   ImageProvider? peerPhoto(String viewer, ChatPeer peer) =>
+@@ -126,17 +147,35 @@ class MessagingRepository {
+     );
+   }
+ 
+-  Future<ChatMessage> send(
+-    String viewer,
+-    String contactId,
+-    String body,
+-    String clientId,
++  Future<ChatMessage> send(String viewer, String contactId, String body) async {
++    final key = (viewer, contactId, body);
++    final pending = _pendingSends.putIfAbsent(key, _PendingSend.new);
++    return pending.request ??= _sendPending(key, pending);
++  }
++
++  Future<ChatMessage> _sendPending(
++    (String, String, String) key,
++    _PendingSend pending,
+   ) async {
+-    final response = await _post(viewer, '/api/chats/$contactId', {
+-      'body': body,
+-      'clientId': clientId,
+-    });
+-    return ChatMessage.fromJson(_json(response, 201));
++    final (viewer, contactId, body) = key;
++    try {
++      final response = await _post(viewer, '/api/chats/$contactId', {
++        'body': body,
++        'clientId': pending.id,
++      });
++      if (const {400, 403, 404, 409}.contains(response.statusCode)) {
++        if (identical(_pendingSends[key], pending)) _pendingSends.remove(key);
++      }
++      final message = ChatMessage.fromJson(_json(response, 201));
++      if (identical(_pendingSends[key], pending)) _pendingSends.remove(key);
++      return message;
++    } finally {
++      pending.request = null;
++    }
++  }
++
++  void clearPendingSends(String viewer) {
++    _pendingSends.removeWhere((key, _) => key.$1 == viewer);
+   }
+ 
+   Future<void> readChat(
+@@ -172,9 +211,10 @@ class MessagingRepository {
      );
      return (
        events: _items(data, 'events').map(InboxEvent.fromJson).toList(),
@@ -382,6 +447,72 @@ index 16c707a..c607d0b 100644
      );
    }
  
+@@ -395,11 +435,10 @@ class _ConversationPageState extends State<ConversationPage> {
+   List<ChatMessage>? _messages;
+   String? _error;
+   String? _readThrough;
+-  String? _retryId;
+-  String? _retryBody;
+   bool _hasMore = false;
+   bool _loading = false;
+   bool _pending = false;
++  bool _earlierPending = false;
+   bool _sending = false;
+   bool _reading = false;
+ 
+@@ -425,7 +464,11 @@ class _ConversationPageState extends State<ConversationPage> {
+ 
+   Future<void> _load({bool earlier = false}) async {
+     if (_loading) {
+-      if (!earlier) _pending = true;
++      if (earlier) {
++        _earlierPending = true;
++      } else {
++        _pending = true;
++      }
+       return;
+     }
+     _loading = true;
+@@ -462,7 +505,11 @@ class _ConversationPageState extends State<ConversationPage> {
+       }
+     } finally {
+       _loading = false;
+-      if (_pending && mounted) {
++      final loadEarlier = _earlierPending && _hasMore;
++      _earlierPending = false;
++      if (mounted && loadEarlier) {
++        unawaited(_load(earlier: true));
++      } else if (_pending && mounted) {
+         _pending = false;
+         unawaited(_load());
+       }
+@@ -518,25 +565,14 @@ class _ConversationPageState extends State<ConversationPage> {
+       setState(() => _error = 'Use up to 2,000 characters.');
+       return;
+     }
+-    if (_retryBody != body) {
+-      _retryBody = body;
+-      _retryId = createUuidV4();
+-    }
+     setState(() {
+       _sending = true;
+       _error = null;
+     });
+     try {
+-      final message = await widget.repository.send(
+-        widget.viewer,
+-        _peer,
+-        body,
+-        _retryId!,
+-      );
++      final message = await widget.repository.send(widget.viewer, _peer, body);
+       if (!mounted) return;
+       if (_input.text.trim() == body) _input.clear();
+-      _retryId = null;
+-      _retryBody = null;
+       setState(() => _messages = _merge(_messages, [message]));
+       widget.onSent?.call();
+       unawaited(AppHaptics.selectionClick());
 diff --git a/app/test/inbox_poller_test.dart b/app/test/inbox_poller_test.dart
 new file mode 100644
 index 0000000..bde3f28
@@ -444,10 +575,15 @@ index 0000000..bde3f28
 +  });
 +}
 diff --git a/app/test/messaging_test.dart b/app/test/messaging_test.dart
-index 59b0610..4480ce2 100644
+index 59b0610..a834f97 100644
 --- a/app/test/messaging_test.dart
 +++ b/app/test/messaging_test.dart
-@@ -7,6 +7,25 @@ import 'package:http/testing.dart';
+@@ -1,3 +1,4 @@
++import 'dart:async';
+ import 'dart:convert';
+ 
+ import 'package:flutter/material.dart';
+@@ -7,8 +8,27 @@ import 'package:http/testing.dart';
  import 'package:link_and_bring/messaging.dart';
  
  void main() {
@@ -471,8 +607,105 @@ index 59b0610..4480ce2 100644
 +  );
 +
    testWidgets(
-     'retry preserves message ID and received messages are marked read',
+-    'retry preserves message ID and received messages are marked read',
++    'retry after reopening preserves message ID and received messages are marked read',
      (tester) async {
+       final changes = ValueNotifier(0);
+       final attempts = <String>[];
+@@ -52,7 +72,7 @@ void main() {
+         Uri.http('localhost'),
+       );
+ 
+-      await tester.pumpWidget(
++      Future<void> openChat() => tester.pumpWidget(
+         MaterialApp(
+           home: ConversationPage(
+             repository: repository,
+@@ -63,12 +83,18 @@ void main() {
+           ),
+         ),
+       );
++      await openChat();
+       await tester.pumpAndSettle();
+       await tester.enterText(find.byType(TextField), 'Hello');
+       await tester.pump();
+       await tester.tap(find.byTooltip('Send'));
+       await tester.pumpAndSettle();
+       expect(find.text('Couldn’t send. Tap Send to retry.'), findsOneWidget);
++      await tester.pumpWidget(const SizedBox());
++      await openChat();
++      await tester.pumpAndSettle();
++      await tester.enterText(find.byType(TextField), 'Hello');
++      await tester.pump();
+       await tester.tap(find.byTooltip('Send'));
+       await tester.pumpAndSettle();
+       expect(attempts, hasLength(2));
+@@ -84,4 +110,65 @@ void main() {
+       changes.dispose();
+     },
+   );
++
++  testWidgets('queues an earlier page during a foreground refresh', (
++    tester,
++  ) async {
++    final changes = ValueNotifier(0);
++    final refresh = Completer<http.Response>();
++    final history = <String?>[];
++    var latestRequests = 0;
++
++    http.Response page(String id, String body, {required bool hasMore}) =>
++        http.Response(
++          jsonEncode({
++            'messages': [
++              {
++                'id': id,
++                'body': body,
++                'sentAt': '2026-11-11T10:00:00Z',
++                'isMine': true,
++              },
++            ],
++            'hasMore': hasMore,
++          }),
++          200,
++        );
++
++    final repository = MessagingRepository(
++      MockClient((request) async {
++        if (request.method == 'POST') return http.Response('', 204);
++        final before = request.url.queryParameters['before'];
++        history.add(before);
++        if (before != null) return page('1', 'Earlier', hasMore: false);
++        if (++latestRequests == 2) return refresh.future;
++        return page('2', 'Latest', hasMore: true);
++      }),
++      Uri.http('localhost'),
++    );
++
++    await tester.pumpWidget(
++      MaterialApp(
++        home: ConversationPage(
++          repository: repository,
++          viewer: 'viewer',
++          peer: const ChatPeer('peer', 'Jamie'),
++          changes: changes,
++          onRead: () {},
++        ),
++      ),
++    );
++    await tester.pumpAndSettle();
++    changes.value++;
++    await tester.pump();
++    await tester.tap(find.text('Load earlier messages'));
++    await tester.pump();
++    expect(history, [null, null]);
++    refresh.complete(page('2', 'Latest', hasMore: true));
++    await tester.pumpAndSettle();
++    expect(history, [null, null, '2']);
++    expect(find.text('Earlier'), findsOneWidget);
++    await tester.pumpWidget(const SizedBox());
++    changes.dispose();
++  });
+ }
 diff --git a/app/test/profile_test.dart b/app/test/profile_test.dart
 index d555f88..6c71bf7 100644
 --- a/app/test/profile_test.dart

@@ -109,11 +109,17 @@ String _cursor(Map<String, dynamic> data, String key) {
   throw FormatException('Invalid messaging cursor: $key');
 }
 
+class _PendingSend {
+  final id = createUuidV4();
+  Future<ChatMessage>? request;
+}
+
 class MessagingRepository {
   MessagingRepository(this._client, this._baseUrl);
 
   final http.Client _client;
   final Uri _baseUrl;
+  final _pendingSends = <(String, String, String), _PendingSend>{};
   Uri get baseUrl => _baseUrl;
 
   ImageProvider? peerPhoto(String viewer, ChatPeer peer) =>
@@ -141,17 +147,35 @@ class MessagingRepository {
     );
   }
 
-  Future<ChatMessage> send(
-    String viewer,
-    String contactId,
-    String body,
-    String clientId,
+  Future<ChatMessage> send(String viewer, String contactId, String body) async {
+    final key = (viewer, contactId, body);
+    final pending = _pendingSends.putIfAbsent(key, _PendingSend.new);
+    return pending.request ??= _sendPending(key, pending);
+  }
+
+  Future<ChatMessage> _sendPending(
+    (String, String, String) key,
+    _PendingSend pending,
   ) async {
-    final response = await _post(viewer, '/api/chats/$contactId', {
-      'body': body,
-      'clientId': clientId,
-    });
-    return ChatMessage.fromJson(_json(response, 201));
+    final (viewer, contactId, body) = key;
+    try {
+      final response = await _post(viewer, '/api/chats/$contactId', {
+        'body': body,
+        'clientId': pending.id,
+      });
+      if (const {400, 403, 404, 409}.contains(response.statusCode)) {
+        if (identical(_pendingSends[key], pending)) _pendingSends.remove(key);
+      }
+      final message = ChatMessage.fromJson(_json(response, 201));
+      if (identical(_pendingSends[key], pending)) _pendingSends.remove(key);
+      return message;
+    } finally {
+      pending.request = null;
+    }
+  }
+
+  void clearPendingSends(String viewer) {
+    _pendingSends.removeWhere((key, _) => key.$1 == viewer);
   }
 
   Future<void> readChat(
@@ -411,11 +435,10 @@ class _ConversationPageState extends State<ConversationPage> {
   List<ChatMessage>? _messages;
   String? _error;
   String? _readThrough;
-  String? _retryId;
-  String? _retryBody;
   bool _hasMore = false;
   bool _loading = false;
   bool _pending = false;
+  bool _earlierPending = false;
   bool _sending = false;
   bool _reading = false;
 
@@ -441,7 +464,11 @@ class _ConversationPageState extends State<ConversationPage> {
 
   Future<void> _load({bool earlier = false}) async {
     if (_loading) {
-      if (!earlier) _pending = true;
+      if (earlier) {
+        _earlierPending = true;
+      } else {
+        _pending = true;
+      }
       return;
     }
     _loading = true;
@@ -478,7 +505,11 @@ class _ConversationPageState extends State<ConversationPage> {
       }
     } finally {
       _loading = false;
-      if (_pending && mounted) {
+      final loadEarlier = _earlierPending && _hasMore;
+      _earlierPending = false;
+      if (mounted && loadEarlier) {
+        unawaited(_load(earlier: true));
+      } else if (_pending && mounted) {
         _pending = false;
         unawaited(_load());
       }
@@ -534,25 +565,14 @@ class _ConversationPageState extends State<ConversationPage> {
       setState(() => _error = 'Use up to 2,000 characters.');
       return;
     }
-    if (_retryBody != body) {
-      _retryBody = body;
-      _retryId = createUuidV4();
-    }
     setState(() {
       _sending = true;
       _error = null;
     });
     try {
-      final message = await widget.repository.send(
-        widget.viewer,
-        _peer,
-        body,
-        _retryId!,
-      );
+      final message = await widget.repository.send(widget.viewer, _peer, body);
       if (!mounted) return;
       if (_input.text.trim() == body) _input.clear();
-      _retryId = null;
-      _retryBody = null;
       setState(() => _messages = _merge(_messages, [message]));
       widget.onSent?.call();
       unawaited(AppHaptics.selectionClick());
