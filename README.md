@@ -4,6 +4,8 @@
 
 ## Что смотреть
 
+[Список задач по итогам ревью](TODO.md)
+
 - [Экраны, отправка и история](app/lib/messaging.dart)
 - [Опрос входящих событий](app/lib/inbox_poller.dart)
 - [Маршруты и транзакции](server/lib/messaging_api.dart)
